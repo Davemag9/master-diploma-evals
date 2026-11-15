@@ -33,10 +33,14 @@ DAILY_SAFETY_CAP = 18  # stay under the real RPD~20 free-tier ceiling, per key
 DAILY_CAP_OVERRIDES = {}
 
 
-def _cap_for(key_idx):
-    return DAILY_CAP_OVERRIDES.get(key_idx, DAILY_SAFETY_CAP)
-
 QUOTA_DIR = Path(__file__).parent / "data" / "cache"
+
+# A lighter model with a much larger free-tier daily quota, used for bulk
+# offline indexing work (e.g. RAPTOR cluster summaries) rather than for the
+# answers being evaluated.
+BULK_MODEL = "gemini-flash-lite-latest"
+BULK_DAILY_CAP = 120
+BULK_MIN_INTERVAL = 4.5
 
 
 class DailyQuotaExceeded(RuntimeError):
@@ -48,14 +52,33 @@ class AllKeysExhausted(RuntimeError):
 
 
 class GenerationClient:
-    def __init__(self):
+    """Per-model client. Each Gemini model has its OWN free-tier quota bucket,
+    so usage is tracked per model: the tightly-limited answer model
+    (gemini-flash-latest, RPD~20) and a lighter bulk model used for offline
+    indexing work such as RAPTOR summarisation (flash-lite, RPD~500) do not
+    consume each other's budget.
+    """
+
+    def __init__(self, model=GEN_MODEL, daily_cap=DAILY_SAFETY_CAP, min_interval=MIN_INTERVAL,
+                 round_robin=False):
         QUOTA_DIR.mkdir(parents=True, exist_ok=True)
-        self._quota_path = QUOTA_DIR / f"gen_quota_multi_{date.today().isoformat()}.json"
+        self._model = model
+        self._daily_cap = daily_cap
+        self._min_interval = min_interval
+        # min_interval is enforced PER KEY, so for bulk indexing work we can
+        # cycle keys on every call and get len(API_KEYS)x the throughput
+        # without exceeding any single key's requests-per-minute limit.
+        self._round_robin = round_robin
+        slug = model.replace(".", "_").replace("-", "_")
+        self._quota_path = QUOTA_DIR / f"gen_quota_{slug}_{date.today().isoformat()}.json"
         self._usage = self._load_usage()
         self._key_idx = 0
-        self._exhausted_keys = set(i for i in range(len(API_KEYS)) if self._usage.get(str(i), 0) >= _cap_for(i))
+        self._exhausted_keys = set(i for i in range(len(API_KEYS)) if self._usage.get(str(i), 0) >= self._cap(i))
         self._last_call = {i: 0.0 for i in range(len(API_KEYS))}
         self._advance_to_usable_key()
+
+    def _cap(self, key_idx):
+        return DAILY_CAP_OVERRIDES.get(key_idx, self._daily_cap)
 
     def _load_usage(self):
         if self._quota_path.exists():
@@ -70,7 +93,7 @@ class GenerationClient:
             self._key_idx = (self._key_idx + 1) % len(API_KEYS)
 
     def remaining_today(self):
-        return sum(max(0, _cap_for(i) - self._usage.get(str(i), 0)) for i in range(len(API_KEYS)))
+        return sum(max(0, self._cap(i) - self._usage.get(str(i), 0)) for i in range(len(API_KEYS)))
 
     def _rotate_key(self):
         self._exhausted_keys.add(self._key_idx)
@@ -84,14 +107,18 @@ class GenerationClient:
 
     def _wait_for_rate_limit(self, on_wait=None):
         elapsed = time.time() - self._last_call[self._key_idx]
-        wait = MIN_INTERVAL - elapsed
+        wait = self._min_interval - elapsed
         if wait > 0:
             if on_wait:
                 on_wait(wait)
             time.sleep(wait)
 
     def generate(self, prompt, on_wait=None):
-        if self._usage.get(str(self._key_idx), 0) >= _cap_for(self._key_idx):
+        if self._round_robin and len(self._exhausted_keys) < len(API_KEYS):
+            self._key_idx = (self._key_idx + 1) % len(API_KEYS)
+            self._advance_to_usable_key()
+
+        if self._usage.get(str(self._key_idx), 0) >= self._cap(self._key_idx):
             self._rotate_key()
 
         self._wait_for_rate_limit(on_wait)
@@ -99,14 +126,21 @@ class GenerationClient:
         payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
 
         backoff = 15
-        for attempt in range(6):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEN_MODEL}:generateContent?key={API_KEYS[self._key_idx]}"
+        # 503 'high demand' spikes are frequent and short-lived: a single retry
+        # often succeeds, so they get their own SHORT capped backoff and more
+        # attempts, instead of the exponential ramp used for real rate limits.
+        overload_backoff = 8
+        MAX_ATTEMPTS = 12
+        for attempt in range(MAX_ATTEMPTS):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={API_KEYS[self._key_idx]}"
             req = urllib.request.Request(
                 url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
             )
             try:
                 self._last_call[self._key_idx] = time.time()
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                # the free tier can take ~25s even for a trivial prompt during
+                # busy periods, and these prompts carry 3000+ chars of context
+                with urllib.request.urlopen(req, timeout=180) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                     self._usage[str(self._key_idx)] = self._usage.get(str(self._key_idx), 0) + 1
                     self._save_usage()
@@ -115,7 +149,7 @@ class GenerationClient:
                 err_body = e.read().decode("utf-8", errors="ignore")
                 if e.code == 429:
                     if "PerDay" in err_body or "RequestsPerDay" in err_body:
-                        self._usage[str(self._key_idx)] = _cap_for(self._key_idx)  # mark spent even if we guessed wrong
+                        self._usage[str(self._key_idx)] = self._cap(self._key_idx)  # mark spent even if we guessed wrong
                         self._save_usage()
                         self._rotate_key()
                         continue
@@ -125,17 +159,21 @@ class GenerationClient:
                     time.sleep(retry_s)
                     backoff *= 2
                     continue
-                if e.code in (500, 502, 503, 504) and attempt < 5:
-                    # transient server-side overload -- retry with backoff, don't burn a key
+                if e.code in (500, 502, 503, 504) and attempt < MAX_ATTEMPTS - 1:
+                    # transient server-side overload -- short capped backoff, and
+                    # move to the next key so we don't also pay this key's RPM wait
                     if on_wait:
-                        on_wait(backoff)
-                    time.sleep(backoff)
-                    backoff *= 2
+                        on_wait(overload_backoff)
+                    time.sleep(overload_backoff)
+                    overload_backoff = min(overload_backoff + 4, 30)
+                    if len(self._exhausted_keys) < len(API_KEYS) - 1:
+                        self._key_idx = (self._key_idx + 1) % len(API_KEYS)
+                        self._advance_to_usable_key()
                     continue
                 raise RuntimeError(f"Generation API error {e.code}: {err_body[:400]}")
             except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError, OSError) as e:
                 # transient network hiccup (dropped connection, DNS blip, etc.) -- retry, don't burn a key
-                if attempt < 5:
+                if attempt < MAX_ATTEMPTS - 1:
                     if on_wait:
                         on_wait(backoff)
                     time.sleep(backoff)

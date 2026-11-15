@@ -13,9 +13,11 @@ through a big batch never loses already-paid-for embeddings.
 import hashlib
 import http.client
 import json
+import threading
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -40,10 +42,14 @@ class EmbeddingClient:
         else:
             self._cache = {}
         self._dirty_count = 0
-        self._last_call = 0.0
+        # MIN_INTERVAL is a per-key requests-per-minute guard, so each key gets
+        # its own clock and calls cycle across keys: len(API_KEYS)x the
+        # throughput without exceeding any single key's rate limit.
+        self._last_call = {i: 0.0 for i in range(len(API_KEYS))}
         self._calls_made = 0
         self._key_idx = 0
         self._exhausted_keys = set()
+        self._lock = threading.Lock()
         self._quota_path = QUOTA_DIR / f"embed_quota_{date.today().isoformat()}.json"
         self._usage = self._load_usage()
 
@@ -67,10 +73,18 @@ class EmbeddingClient:
     def _key(text):
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def _pace(self):
-        elapsed = time.time() - self._last_call
+    def _pace_key(self, key_idx):
+        elapsed = time.time() - self._last_call[key_idx]
         if elapsed < MIN_INTERVAL:
             time.sleep(MIN_INTERVAL - elapsed)
+
+    def _next_key(self):
+        """Move to the next key that still has quota, for the next request."""
+        if len(self._exhausted_keys) >= len(API_KEYS):
+            return
+        self._key_idx = (self._key_idx + 1) % len(API_KEYS)
+        while self._key_idx in self._exhausted_keys:
+            self._key_idx = (self._key_idx + 1) % len(API_KEYS)
 
     def _current_key(self):
         return API_KEYS[self._key_idx]
@@ -86,28 +100,53 @@ class EmbeddingClient:
         while self._key_idx in self._exhausted_keys:
             self._key_idx = (self._key_idx + 1) % len(API_KEYS)
 
-    def _call_api(self, text):
+    def _call_api(self, text, key_idx=None):
+        """Embed one text. `key_idx` pins the call to one key, which is what
+        lets several calls run at once: each key keeps its own clock, so N
+        workers on N keys stay inside every key's rate limit."""
         payload = json.dumps({"content": {"parts": [{"text": text}]}}).encode("utf-8")
         backoff = 5
+        pinned = key_idx is not None
+        if not pinned:
+            self._next_key()
+            key_idx = self._key_idx
         for attempt in range(6):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:embedContent?key={self._current_key()}"
+            if key_idx in self._exhausted_keys:
+                if len(self._exhausted_keys) >= len(API_KEYS):
+                    raise AllKeysExhausted(
+                        f"All {len(API_KEYS)} embedding API keys hit their daily quota. "
+                        f"Usage today: {self._usage}. Free-tier quota resets ~00:00 Pacific Time."
+                    )
+                key_idx = (key_idx + 1) % len(API_KEYS)
+                while key_idx in self._exhausted_keys:
+                    key_idx = (key_idx + 1) % len(API_KEYS)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:embedContent?key={API_KEYS[key_idx]}"
             req = urllib.request.Request(
                 url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
             )
-            self._pace()
+            self._pace_key(key_idx)
             try:
-                self._last_call = time.time()
+                self._last_call[key_idx] = time.time()
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    self._calls_made += 1
-                    self._usage[str(self._key_idx)] = self._usage.get(str(self._key_idx), 0) + 1
                     body = json.loads(resp.read().decode("utf-8"))
-                    return body["embedding"]["values"]
+                with self._lock:
+                    self._calls_made += 1
+                    self._usage[str(key_idx)] = self._usage.get(str(key_idx), 0) + 1
+                return body["embedding"]["values"]
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore")
                 if e.code == 429:
                     if "PerDay" in err_body or "RequestsPerDay" in err_body:
-                        self._rotate_key()
-                        continue  # retry immediately on the new key, no backoff needed
+                        with self._lock:
+                            self._exhausted_keys.add(key_idx)
+                            spent = len(self._exhausted_keys) >= len(API_KEYS)
+                        if spent:
+                            raise AllKeysExhausted(
+                                f"All {len(API_KEYS)} embedding API keys hit their daily quota. "
+                                f"Usage today: {self._usage}. "
+                                "Free-tier quota resets ~00:00 Pacific Time."
+                            )
+                        continue  # retry on another key, no backoff needed
                     if attempt < 5:
                         time.sleep(backoff)
                         backoff *= 2
@@ -135,12 +174,54 @@ class EmbeddingClient:
         return vec
 
     def embed_many(self, texts, on_progress=None):
-        vectors = []
+        """Embed a list of texts, cache-first, with one worker per API key.
+
+        Cache hits are free and stay on this thread; only the misses are
+        farmed out, each pinned to its own key so no key exceeds its rate
+        limit. Results keep the input order.
+        """
+        vectors = [None] * len(texts)
+        misses = []
+        for i, t in enumerate(texts):
+            key = self._key(t)
+            cached = self._cache.get(key)
+            if cached is not None:
+                vectors[i] = cached
+            else:
+                misses.append((i, t))
+
+        done = len(texts) - len(misses)
+        if on_progress and done:
+            on_progress(done, len(texts))
+
+        if not misses:
+            return vectors
+
+        error = None
         try:
-            for i, t in enumerate(texts):
-                vectors.append(self.embed(t))
-                if on_progress:
-                    on_progress(i + 1, len(texts))
+            with ThreadPoolExecutor(max_workers=len(API_KEYS)) as pool:
+                futures = {}
+                for n, (slot, text) in enumerate(misses):
+                    fut = pool.submit(self._call_api, text, n % len(API_KEYS))
+                    futures[fut] = (slot, text)
+                for fut in as_completed(futures):
+                    slot, text = futures[fut]
+                    try:
+                        vec = fut.result()
+                    except Exception as e:  # remember the first failure
+                        error = error or e
+                        continue
+                    vectors[slot] = vec
+                    with self._lock:
+                        self._cache[self._key(text)] = vec
+                        self._dirty_count += 1
+                    done += 1
+                    if on_progress:
+                        on_progress(done, len(texts))
         finally:
-            self._save_cache()  # always persist whatever we got, even on crash/exception
+            self._save_cache()  # always persist whatever we got
+            self._save_usage()
+
+        if error is not None:
+            raise error
         return vectors

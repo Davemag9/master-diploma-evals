@@ -38,6 +38,7 @@ TOP_KS = [1, 3, 5]
 # hierarchical-breadcrumb vs table-aware vs semantic, plus the whole-doc
 # baseline that "beremo tsili faily" argues against.
 FINAL_CONFIGS = [
+    # --- baselines from the first wave of the experiment ---
     "whole_doc",
     "fixed_400_0",
     "fixed_400_100",
@@ -46,6 +47,20 @@ FINAL_CONFIGS = [
     "hierarchical_800",
     "table_aware_3row",
     "semantic_600",
+    # --- external / industry baselines (LangChain) ---
+    "lc_recursive_400",
+    "lc_recursive_800",
+    "lc_recursive_1500",
+    "lc_markdown_500",
+    "lc_markdown_800",
+    "lc_token_512",
+    # --- proposed method: adaptive structural-semantic segmentation ---
+    "adaptive_nosem",   # ablation: structural rules only, no semantic split point
+    "adaptive_hybrid",  # full method
+    "adaptive_tight",
+    "adaptive_wide",
+    # --- external baseline: RAPTOR tree (collapsed-tree retrieval) ---
+    "raptor",
 ]
 
 
@@ -54,7 +69,10 @@ def load_docs():
 
 
 def is_relevant_chunk(chunk, item):
-    if chunk["doc"] != item["gold_doc"]:
+    # A RAPTOR summary node can span several source documents, so match against
+    # the node's full document set rather than a single "doc" label.
+    chunk_docs = chunk.get("docs") or [chunk["doc"]]
+    if item["gold_doc"] not in chunk_docs:
         return False
     text_lower = chunk["text"].lower()
     return any(kw.lower() in text_lower for kw in item["fact_keywords"])
@@ -106,10 +124,16 @@ def main():
     for ci, config_name in enumerate(config_names, 1):
         print(f"\n[{ci}/{len(config_names)}] config = {config_name}", file=sys.stderr)
 
-        needs_embedder = CHUNKING_CONFIGS[config_name]["kind"] in EMBEDDER_REQUIRED_KINDS
-        all_chunks = []
+        if config_name == "raptor":
+            # Collapsed-tree retrieval: leaves + every summary node, one index.
+            from generation_compare_v2 import build_method_chunks
+            all_chunks = build_method_chunks("raptor", docs, embedder)
+            needs_embedder = False
+        else:
+            needs_embedder = CHUNKING_CONFIGS[config_name]["kind"] in EMBEDDER_REQUIRED_KINDS
+            all_chunks = []
         try:
-            for doc_name, text in docs.items():
+            for doc_name, text in (docs.items() if config_name != "raptor" else []):
                 kwargs = {"embedder": embedder} if needs_embedder else {}
                 all_chunks.extend(build_chunks(config_name, doc_name, text, **kwargs))
         except AllKeysExhausted as e:
